@@ -23,17 +23,21 @@
 #include <time.h>
 #include <errno.h>
 #include "fru.h"
+#include "fru_reader.h"
 #include "smbios.h"
+#include "fatal.h"
 
 #ifdef __HAS_JSON__
 #include <json-c/json.h>
 #endif
 
-#define fatal(fmt, args...) do {  \
-	fprintf(stderr, fmt, ##args); \
-	fprintf(stderr, "\n");        \
-	exit(1);                      \
-} while(0)
+const char* type_names[] = {
+	"auto",
+	"binary",
+	"bcdplus",
+	"sixbitascii",
+	"text"
+};
 
 volatile int debug_level = 0;
 #define debug(level, fmt, args...) do { \
@@ -46,6 +50,56 @@ volatile int debug_level = 0;
 		errno = e;                      \
 	}                                   \
 } while(0)
+
+static
+int typelen2ind(uint8_t field) {
+	if (FRU_ISTYPE(field, TEXT)) {
+		return 4;
+	} else if (FRU_ISTYPE(field, ASCII_6BIT)) {
+		return 3;
+	} else if (FRU_ISTYPE(field, BCDPLUS)) {
+		return 2;
+	} else if (FRU_ISTYPE(field, BINARY)) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+static
+int json_object_add_with_type(struct json_object* obj,
+			      const char* key,
+			      const char* val,
+			      int type) {
+	struct json_object *string, *type_string, *entry;
+	if ((string = json_object_new_string(val)) == NULL)
+		goto STRING_ERR;
+
+	if (type == 0) {
+		entry = string;
+	} else {
+		if ((type_string = json_object_new_string(type_names[type])) == NULL)
+			goto TYPE_STRING_ERR;
+		if ((entry = json_object_new_object()) == NULL)
+			goto ENTRY_ERR;
+		if (json_object_object_add(entry, "type", type_string))
+			goto ADD_ERR;
+		if (json_object_object_add(entry, "data", string))
+			goto ADD_ERR;
+	}
+	if (key == NULL)
+		return json_object_array_add(obj, entry);
+	else
+		return json_object_object_add(obj, key, entry);
+
+ADD_ERR:
+ENTRY_ERR:
+	json_object_put(type_string);
+TYPE_STRING_ERR:
+	json_object_put(string);
+STRING_ERR:
+	return -1;
+}
 
 static
 void hexdump(const void *data, size_t len)
@@ -431,6 +485,9 @@ int main(int argc, char *argv[])
 		/* Set input file format to JSON */
 		{ .name = "json",          .val = 'j', .has_arg = false },
 
+		/* Set input file format to raw binary */
+		{ .name = "raw",          .val = 'r', .has_arg = false },
+
 		/* Set file to load the data from */
 		{ .name = "from",          .val = 'z', .has_arg = true },
 
@@ -473,6 +530,7 @@ int main(int argc, char *argv[])
 		['I'] = "Disable auto-encoding on all fields, force ASCII.\n\t\t"
 			    "Out of ASCII range data will still result in binary encoding",
 		['j'] = "Set input text file format to JSON (default). Specify before '--from'",
+		['r'] = "Set input file format to raw binary. Specify before '--from'",
 		['z'] = "Load FRU information from a text file",
 		/* Chassis info area related options */
 		['t'] = "Set chassis type (hex). Defaults to 0x02 ('Unknown')",
@@ -510,7 +568,8 @@ int main(int argc, char *argv[])
 	     has_multirec = false;
 	fru_mr_reclist_t *mr_reclist = NULL;
 
-	bool use_json = true; /* TODO: Add more input formats, consider libconfig */
+	bool use_json = false; /* TODO: Add more input formats, consider libconfig */
+	bool use_binary = false;
 
 	unsigned char optstring[ARRAY_SZ(options) * 2 + 1] = {0};
 
@@ -567,6 +626,16 @@ int main(int argc, char *argv[])
 
 			case 'j': // json
 				use_json = true;
+				if (use_binary) {
+					fatal("Can't specify --json and --raw together");
+				}
+				break;
+
+			case 'r': // binary
+				use_binary = true;
+				if (use_json) {
+					fatal("Can't specify --json and --raw together");
+				}
 				break;
 
 			case 'z': // from
@@ -673,6 +742,61 @@ int main(int argc, char *argv[])
 #else
 					fatal("JSON support was disabled at compile time");
 #endif
+				}
+				else if (use_binary) {
+					int fd = open(optarg, O_RDONLY);
+					if (fd < 0) {
+						fatal("Failed to open file: %s", strerror(errno));
+					}
+
+					fru_t *raw_fru = read_fru_header(fd);
+					if (!raw_fru)
+						fatal("Failed to read fru header");
+
+					if (raw_fru->chassis != 0) {
+						if (lseek(fd, 8 * raw_fru->chassis, SEEK_SET) < 0)
+							fatal("Failed to seek");
+
+						fru_chassis_area_t *chassis_raw =
+							read_fru_chassis_area(fd);
+						bool success = fru_decode_chassis_info(
+							chassis_raw, &chassis);
+						if (!success)
+							fatal("Failed to decode chassis");
+
+						free(chassis_raw);
+						has_chassis = true;
+					}
+					if (raw_fru->board != 0) {
+						if(lseek(fd, 8 * raw_fru->board, SEEK_SET) < 0)
+							fatal("Failed to seek");
+
+						fru_board_area_t *board_raw = read_fru_board_area(fd);
+						bool success = fru_decode_board_info(board_raw, &board);
+						if (!success)
+							fatal("Failed to decode board");
+
+						free(board_raw);
+						has_board = true;
+						has_bdate = true;
+					}
+					if (raw_fru->product != 0) {
+						if (lseek(fd, 8 * raw_fru->product, SEEK_SET) < 0)
+							fatal("Failed to seek");
+
+						fru_product_area_t *product_raw =
+							read_fru_product_area(fd);
+						bool success =
+							fru_decode_product_info(product_raw, &product);
+						if (!success)
+							fatal("Failed to decode product");
+
+						free(product_raw);
+						has_product = true;
+					}
+
+					free(raw_fru);
+					close(fd);
 				}
 				else {
 					fatal("The requested input file format is not supported");
@@ -816,120 +940,245 @@ int main(int argc, char *argv[])
 		}
 	} while (opt != -1);
 
-	if (optind >= argc)
-		fatal("Filename must be specified");
+	if (use_binary) {
+		char timebuf[20] = {0};
+		struct tm* bdtime = gmtime(&board.tv.tv_sec);
+		strftime(timebuf, 20, "%d/%m/%Y %H:%M:%S", bdtime);
+#ifdef __HAS_JSON__
+		struct json_object *json_root = json_object_new_object();
+		struct json_object *section = NULL, *temp_obj = NULL;
 
-	fname = argv[optind];
-	debug(1, "FRU info data will be stored in %s", fname);
-
-	if (has_internal) {
-		debug(1, "FRU file will have an internal use area");
-		/* Nothing to do here, added for uniformity, the actual
-		 * internal use area can only be initialized from file */
-	}
-
-	if (has_chassis) {
-		int e;
-		fru_chassis_area_t *ci = NULL;
-		debug(1, "FRU file will have a chassis information area");
-		debug(3, "Chassis information area's custom field list is %p", chassis.cust);
-		ci = fru_chassis_info(&chassis);
-		e = errno;
-		free_reclist(chassis.cust);
-
-		if (ci)
-			areas[FRU_CHASSIS_INFO].data = ci;
-		else {
-			errno = e;
-			fatal("Error allocating a chassis info area: %m");
-		}
-	}
-
-	if (has_board) {
-		int e;
-		fru_board_area_t *bi = NULL;
-		debug(1, "FRU file will have a board information area");
-		debug(3, "Board information area's custom field list is %p", board.cust);
-		debug(3, "Board date is specified? = %d", has_bdate);
-		debug(3, "Board date use unspec? = %d", no_curr_date);
-		if (!has_bdate && no_curr_date) {
-			debug(1, "Using 'unspecified' board mfg. date");
-			board.tv = (struct timeval){0};
+		if (has_chassis) {
+			section = json_object_new_object();
+			temp_obj = json_object_new_int(chassis.type);
+			json_object_object_add(section, "type", temp_obj);
+			json_object_add_with_type(section, "pn", chassis.pn.val, chassis.pn.type);
+			json_object_add_with_type(section, "serial", chassis.serial.val, chassis.serial.type);
+			temp_obj = json_object_new_array();
+			fru_reclist_t *next = chassis.cust;
+			while (next != NULL) {
+				json_object_add_with_type(temp_obj, NULL, next->rec->data,
+							  typelen2ind(next->rec->typelen));
+				next = next->next;
+			}
+			json_object_object_add(section, "custom", temp_obj);
+			json_object_object_add(json_root, "chassis", section);
 		}
 
-		bi = fru_board_info(&board);
-		e = errno;
-		free_reclist(board.cust);
-
-		if (bi)
-			areas[FRU_BOARD_INFO].data = bi;
-		else {
-			errno = e;
-			fatal("Error allocating a board info area: %m");
+		if (has_product) {
+			section = json_object_new_object();
+			temp_obj = json_object_new_int(product.lang);
+			json_object_object_add(section, "lang", temp_obj);
+			json_object_add_with_type(section, "mfg", product.mfg.val, product.mfg.type);
+			json_object_add_with_type(section, "pname", product.pname.val, product.pname.type);
+			json_object_add_with_type(section, "serial", product.serial.val, product.serial.type);
+			json_object_add_with_type(section, "pn", product.pn.val, product.pn.type);
+			json_object_add_with_type(section, "ver", product.ver.val, product.ver.type);
+			json_object_add_with_type(section, "atag", product.atag.val, product.atag.type);
+			json_object_add_with_type(section, "file", product.file.val, product.file.type);
+			temp_obj = json_object_new_array();
+			fru_reclist_t *next = product.cust;
+			while (next != NULL) {
+				json_object_add_with_type(temp_obj, NULL, next->rec->data,
+							  typelen2ind(next->rec->typelen));
+				next = next->next;
+			}
+			json_object_object_add(section, "custom", temp_obj);
+			json_object_object_add(json_root, "product", section);
 		}
-	}
 
-	if (has_product) {
-		int e;
-		fru_product_area_t *pi = NULL;
-		debug(1, "FRU file will have a product information area");
-		debug(3, "Product information area's custom field list is %p", product.cust);
-		pi = fru_product_info(&product);
-
-		e = errno;
-		free_reclist(product.cust);
-
-		if (pi)
-			areas[FRU_PRODUCT_INFO].data = pi;
-		else {
-			errno = e;
-			fatal("Error allocating a product info area: %m");
+		if (has_board) {
+			section = json_object_new_object();
+			temp_obj = json_object_new_int(board.lang);
+			json_object_object_add(section, "lang", temp_obj);
+			json_object_add_with_type(section, "time", timebuf, 0);
+			json_object_add_with_type(section, "mfg", board.mfg.val, board.mfg.type);
+			json_object_add_with_type(section, "pname", board.pname.val, board.pname.type);
+			json_object_add_with_type(section, "serial", board.serial.val, board.serial.type);
+			json_object_add_with_type(section, "pn", board.pn.val, board.pn.type);
+			json_object_add_with_type(section, "file", board.file.val, board.file.type);
+			temp_obj = json_object_new_array();
+			fru_reclist_t *next = board.cust;
+			while (next != NULL) {
+				json_object_add_with_type(temp_obj, NULL, next->rec->data,
+							  typelen2ind(next->rec->typelen));
+				next = next->next;
+			}
+			json_object_object_add(section, "custom", temp_obj);
+			json_object_object_add(json_root, "board", section);
 		}
-	}
-
-	if (has_multirec) {
-		int e;
-		fru_mr_area_t *mr = NULL;
-		size_t totalbytes = 0;
-		debug(1, "FRU file will have a multirecord area");
-		debug(3, "Multirecord area record list is %p", mr_reclist);
-		mr = fru_mr_area(mr_reclist, &totalbytes);
-
-		e = errno;
-		free_reclist(mr_reclist);
-
-		if (mr) {
-			areas[FRU_MULTIRECORD].data = mr;
-			areas[FRU_MULTIRECORD].blocks = FRU_BLOCKS(totalbytes);
-
-			debug_dump(3, mr, totalbytes, "Multirecord data:");
-		}
-		else {
-			errno = e;
-			fatal("Error allocating a multirecord area: %m");
-		}
-	}
-
-	fru = fru_create(areas, &size);
-	if (!fru) {
-		fatal("Error allocating a FRU file buffer: %m");
-	}
-
-	debug(1, "Writing %lu bytes of FRU data", (long unsigned int)FRU_BYTES(size));
-
-	fd = open(fname,
-#if __WIN32__ || __WIN64__
-	          O_CREAT | O_TRUNC | O_WRONLY | O_BINARY,
+		// dump to stdout
+		json_object_to_fd(fileno(stdout), json_root, 0);
+		json_object_put(json_root);
 #else
-	          O_CREAT | O_TRUNC | O_WRONLY,
+		if (has_chassis) {
+			puts("Chassis");
+			printf("\ttype: %u\n", chassis.type);
+			printf("\tpn(%s): %s\n", type_names[chassis.pn.type], chassis.pn.val);
+			printf("\tserial(%s): %s\n", type_names[chassis.serial.type], chassis.serial.val);
+			fru_reclist_t *next = chassis.cust;
+			while (next != NULL) {
+				printf("\tcustom(%s): %s\n",
+				       type_names[typelen2ind(next->rec->typelen)],
+				       next->rec->data);
+				next = next->next;
+			}
+                }
+
+                if (has_product) {
+			puts("Product");
+			printf("\tlang: %u\n", product.lang);
+			printf("\tmfg(%s): %s\n", type_names[product.mfg.type], product.mfg.val);
+			printf("\tpname(%s): %s\n", type_names[product.pname.type], product.pname.val);
+			printf("\tserial(%s): %s\n", type_names[product.serial.type], product.serial.val);
+			printf("\tpn(%s): %s\n", type_names[product.pn.type], product.pn.val);
+			printf("\tver(%s): %s\n", type_names[product.ver.type], product.ver.val);
+			printf("\tatag(%s): %s\n", type_names[product.atag.type], product.atag.val);
+			printf("\tfile(%s): %s\n", type_names[product.file.type], product.file.val);
+			next = product.cust;
+			while (next != NULL) {
+				printf("\tcustom(%s): %s\n",
+				       type_names[typelen2ind(next->rec->typelen)],
+				       next->rec->data);
+				next = next->next;
+			}
+                }
+
+                if (has_board) {
+			puts("Board");
+			printf("\tlang: %u\n", board.lang);
+			printf("\ttime: %s\n", timebuf);
+			printf("\tmfg(%s): %s\n", type_names[board.mfg.type], board.mfg.val);
+			printf("\tpname(%s): %s\n", type_names[board.pname.type], board.pname.val);
+			printf("\tserial(%s): %s\n", type_names[board.serial.type], board.serial.val);
+			printf("\tpn(%s): %s\n", type_names[board.pn.type], board.pn.val);
+			printf("\tfile(%s): %s\n", type_names[board.file.type], board.file.val);
+			next = board.cust;
+			while (next != NULL) {
+				printf("\tcustom(%s): %s\n",
+				       type_names[typelen2ind(next->rec->typelen)],
+				       next->rec->data);
+				next = next->next;
+			}
+                }
 #endif
-	          0644);
+	} else {
+		if (optind >= argc)
+			fatal("Filename must be specified");
 
-	if (fd < 0)
-		fatal("Couldn't create file %s: %m", fname);
+		fname = argv[optind];
+		debug(1, "FRU info data will be stored in %s", fname);
 
-	if (0 > write(fd, fru, FRU_BYTES(size)))
-		fatal("Couldn't write to %s: %m", fname);
+		if (has_internal) {
+			debug(1, "FRU file will have an internal use area");
+			/* Nothing to do here, added for uniformity, the actual
+			 * internal use area can only be initialized from file */
+		}
 
-	free(fru);
+		if (has_chassis) {
+			int e;
+			fru_chassis_area_t *ci = NULL;
+			debug(1, "FRU file will have a chassis information area");
+			debug(3, "Chassis information area's custom field list is %p", chassis.cust);
+			ci = fru_encode_chassis_info(&chassis);
+			e = errno;
+			free_reclist(chassis.cust);
+
+			if (ci)
+				areas[FRU_CHASSIS_INFO].data = ci;
+			else {
+				errno = e;
+				fatal("Error allocating a chassis info area: %m");
+			}
+		}
+
+		if (has_board) {
+			int e;
+			fru_board_area_t *bi = NULL;
+			debug(1, "FRU file will have a board information area");
+			debug(3, "Board information area's custom field list is %p", board.cust);
+			debug(3, "Board date is specified? = %d", has_bdate);
+			debug(3, "Board date use unspec? = %d", no_curr_date);
+			if (!has_bdate && no_curr_date) {
+				debug(1, "Using 'unspecified' board mfg. date");
+				board.tv = (struct timeval){0};
+			}
+
+			bi = fru_encode_board_info(&board);
+			e = errno;
+			free_reclist(board.cust);
+
+			if (bi)
+				areas[FRU_BOARD_INFO].data = bi;
+			else {
+				errno = e;
+				fatal("Error allocating a board info area: %m");
+			}
+		}
+
+		if (has_product) {
+			int e;
+			fru_product_area_t *pi = NULL;
+			debug(1, "FRU file will have a product information area");
+			debug(3, "Product information area's custom field list is %p", product.cust);
+			pi = fru_encode_product_info(&product);
+
+			e = errno;
+			free_reclist(product.cust);
+
+			if (pi)
+				areas[FRU_PRODUCT_INFO].data = pi;
+			else {
+				errno = e;
+				fatal("Error allocating a product info area: %m");
+			}
+		}
+
+		if (has_multirec) {
+			int e;
+			fru_mr_area_t *mr = NULL;
+			size_t totalbytes = 0;
+			debug(1, "FRU file will have a multirecord area");
+			debug(3, "Multirecord area record list is %p", mr_reclist);
+			mr = fru_mr_area(mr_reclist, &totalbytes);
+
+			e = errno;
+			free_reclist(mr_reclist);
+
+			if (mr) {
+				areas[FRU_MULTIRECORD].data = mr;
+				areas[FRU_MULTIRECORD].blocks = FRU_BLOCKS(totalbytes);
+
+				debug_dump(3, mr, totalbytes, "Multirecord data:");
+			}
+			else {
+				errno = e;
+				fatal("Error allocating a multirecord area: %m");
+			}
+		}
+
+		fru = fru_create(areas, &size);
+		if (!fru) {
+			fatal("Error allocating a FRU file buffer: %m");
+		}
+
+		debug(1, "Writing %lu bytes of FRU data", (long unsigned int)FRU_BYTES(size));
+
+		fd = open(fname,
+#if __WIN32__ || __WIN64__
+			  O_CREAT | O_TRUNC | O_WRONLY | O_BINARY,
+#else
+			  O_CREAT | O_TRUNC | O_WRONLY,
+#endif
+			  0644);
+
+		if (fd < 0)
+			fatal("Couldn't create file %s: %m", fname);
+
+		if (0 > write(fd, fru, FRU_BYTES(size)))
+			fatal("Couldn't write to %s: %m", fname);
+
+		free(fru);
+		close(fd);
+	}
 }

@@ -327,13 +327,93 @@ fru_mr_reclist_t * add_mr_reclist(fru_mr_reclist_t **reclist);
 fru_mr_area_t * fru_mr_area(fru_mr_reclist_t *reclist, size_t *total);
 
 fru_chassis_area_t * fru_encode_chassis_info(const fru_exploded_chassis_t *chassis);
-bool fru_decode_chassis_info(const fru_chassis_area_t *area, fru_exploded_chassis_t *chassis_out);
 fru_board_area_t * fru_encode_board_info(const fru_exploded_board_t *board);
-bool fru_decode_board_info(const fru_board_area_t *area, fru_exploded_board_t *board_out);
 fru_product_area_t * fru_encode_product_info(const fru_exploded_product_t *product);
-bool fru_decode_product_info(const fru_product_area_t *area, fru_exploded_product_t *product_out);
 fru_field_t * fru_encode_data(int len, const uint8_t *data);
-bool fru_decode_data(fru_field_t *field, typed_field_t *out, size_t out_len);
 fru_t * fru_create(fru_area_t area[FRU_MAX_AREAS], size_t *size);
+
+/**
+ * @brief Find and validate FRU header in the byte buffer.
+ *
+ * @param[in] buffer Byte buffer.
+ * @param[in] size Byte buffer size.
+ * @return Pointer to the FRU header in the buffer.
+ * @retval NULL FRU header not found.
+ */
+fru_t *find_fru_header(uint8_t *buffer, size_t size);
+
+/**
+ * @brief Find and validate FRU chassis area in the byte buffer.
+ *
+ * @param[in] buffer Byte buffer.
+ * @param[in] size Byte buffer size.
+ * @return Pointer to the FRU chassis area in the buffer.
+ * @retval NULL FRU chassis area not found.
+ */
+fru_chassis_area_t *find_fru_chassis_area(uint8_t *buffer, size_t size);
+
+/**
+ * @brief Find and validate FRU board area in the byte buffer.
+ *
+ * @param[in] buffer Byte buffer.
+ * @param[in] size Byte buffer size.
+ * @return Pointer to the FRU board area in the buffer.
+ * @retval NULL FRU board area not found.
+ */
+fru_board_area_t *find_fru_board_area(uint8_t *buffer, size_t size);
+
+/**
+ * @brief Find and validate FRU product area in the byte buffer.
+ *
+ * @param[in] buffer Byte buffer.
+ * @param[in] size Byte buffer size.
+ * @return Pointer to the FRU product area in the buffer.
+ * @retval NULL FRU product area not found.
+ */
+fru_product_area_t *find_fru_product_area(uint8_t *buffer, size_t size);
+
+/**
+ * @brief Decode chassis area into \p fru_exploded_chassis_t.
+ *
+ * @param[in] area Encoded area.
+ * @param[out] chassis_out Decoded structure.
+ * @retval true Success.
+ * @retval false Failure.
+ */
+bool fru_decode_chassis_info(const fru_chassis_area_t *area, fru_exploded_chassis_t *chassis_out);
+
+/**
+ * @brief Decode board area into \p fru_exploded_board_t.
+ *
+ * @param[in] area Encoded area.
+ * @param[out] chassis_out Decoded structure.
+ * @retval true Success.
+ * @retval false Failure.
+ */
+bool fru_decode_board_info(const fru_board_area_t *area, fru_exploded_board_t *board_out);
+
+/**
+ * @brief Decode product area into \p fru_product_board_t.
+ *
+ * @param[in] area Encoded area.
+ * @param[out] chassis_out Decoded structure.
+ * @retval true Success.
+ * @retval false Failure.
+ */
+bool fru_decode_product_info(const fru_product_area_t *area, fru_exploded_product_t *product_out);
+
+/**
+ * Decode data from a buffer into another buffer.
+ *
+ * For binary data use FRU_FIELDDATALEN(field->typelen) to find
+ * out the size of valid bytes in the returned buffer.
+ *
+ * @param[in] field Encoded data field.
+ * @param[out] out Decoded field.
+ * @param[in] out_len Size of the decoded field region.
+ * @retval true Success.
+ * @retval false Failure.
+ */
+bool fru_decode_data(fru_field_t *field, typed_field_t *out, size_t out_len);
 
 #endif // __FRULIB_FRU_H__

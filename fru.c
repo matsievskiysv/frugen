@@ -404,17 +404,9 @@ fru_field_t * fru_encode_data(int len, const uint8_t *data)
 	return out;
 }
 
-/**
- * Decode data from a buffer into another buffer.
- *
- * For binary data use FRU_FIELDDATALEN(field->typelen) to find
- * out the size of valid bytes in the returned buffer.
- *
- * Return false if there were errors during decoding and true otherwise.
- */
 bool fru_decode_data(fru_field_t *field,
-                     typed_field_t *out, //< [out] buffer to decode into
-                     size_t out_len) // <[in] length of output buffer
+                     typed_field_t *out,
+                     size_t out_len)
 {
 	if (!field) return false;
 
@@ -1225,6 +1217,57 @@ fru_t * fru_create(fru_area_t area[FRU_MAX_AREAS], size_t *size)
 	return out;
 }
 
+fru_t *find_fru_header(uint8_t *buffer, size_t size) {
+	if (size < 8) {
+		errno = ENOBUFS;
+		return NULL;
+	}
+	fru_t *header = (fru_t *) buffer;
+	if ((header->ver != FRU_VER_1) || (header->rsvd != 0) || (header->pad != 0)) {
+		errno = EPROTO;
+		return NULL;
+	}
+	if (header->hchecksum != calc_checksum(header, sizeof(fru_t) - 1)) {
+		errno = EPROTO;
+		return NULL;
+	}
+	return header;
+}
+
+#define AREAS \
+	X(chassis) \
+	X(board) \
+	X(product)
+#define X(AREA)                                                                    \
+fru_##AREA##_area_t *find_fru_##AREA##_area(uint8_t *buffer, size_t size) {        \
+	fru_t *header = find_fru_header(buffer, size);                             \
+	if ((header == NULL) || (header->AREA == 0)) {                             \
+		return NULL;                                                       \
+	}                                                                          \
+	if ((header->AREA + 3) > size) {                                           \
+		errno = ENOBUFS;                                                   \
+		return NULL;                                                       \
+	}                                                                          \
+	fru_##AREA##_area_t *area =                                                \
+	    (fru_##AREA##_area_t *)(buffer + FRU_BYTES(header->AREA));             \
+	if (area->ver != 1) {                                                      \
+		errno = EPROTO;                                                    \
+		return NULL;                                                       \
+	}                                                                          \
+	if (FRU_BYTES(header->AREA) + FRU_BYTES(area->blocks) > size) {            \
+		errno = ENOBUFS;                                                   \
+		return NULL;                                                       \
+	}                                                                          \
+	if (*(((uint8_t *)area) + FRU_BYTES(area->blocks) - 1) !=                  \
+	    calc_checksum(((uint8_t *)area), FRU_BYTES(area->blocks) - 1)) {       \
+		errno = EPROTO;                                                    \
+		return NULL;                                                       \
+	}                                                                          \
+	return area;                                                               \
+}
+AREAS
+#undef X
+#undef AREAS
 
 #ifdef __STANDALONE__
 

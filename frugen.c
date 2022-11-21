@@ -9,6 +9,7 @@
 #endif
 
 #define COPYRIGHT_YEARS "2016-2021"
+#define MAX_FILE_SIZE 1L * 1024L * 1024L
 
 #define _GNU_SOURCE
 #include <getopt.h>
@@ -23,13 +24,17 @@
 #include <time.h>
 #include <errno.h>
 #include "fru.h"
-#include "fru_reader.h"
 #include "smbios.h"
-#include "fatal.h"
 
 #ifdef __HAS_JSON__
 #include <json-c/json.h>
 #endif
+
+#define fatal(fmt, args...) do {  \
+	fprintf(stderr, fmt, ##args); \
+	fprintf(stderr, "\n");        \
+	exit(1);                      \
+} while(0)
 
 const char* type_names[] = {
 	"auto",
@@ -749,54 +754,48 @@ int main(int argc, char *argv[])
 						fatal("Failed to open file: %s", strerror(errno));
 					}
 
-					fru_t *raw_fru = read_fru_header(fd);
-					if (!raw_fru)
-						fatal("Failed to read fru header");
+					struct stat statbuf = {0};
+					if (fstat(fd, &statbuf)) {
+						fatal("Failed to get file properties: %s", strerror(errno));
+					}
+					if (statbuf.st_size > MAX_FILE_SIZE) {
+						fatal("File too large");
+					}
 
-					if (raw_fru->chassis != 0) {
-						if (lseek(fd, 8 * raw_fru->chassis, SEEK_SET) < 0)
-							fatal("Failed to seek");
+					uint8_t *buffer = calloc(1, statbuf.st_size);
+					if (buffer == NULL) {
+						fatal("Cannot allocate buffer");
+					}
 
-						fru_chassis_area_t *chassis_raw =
-							read_fru_chassis_area(fd);
-						bool success = fru_decode_chassis_info(
-							chassis_raw, &chassis);
-						if (!success)
+					if (read(fd, buffer, statbuf.st_size) != statbuf.st_size) {
+						fatal("Cannot read file");
+					}
+					close(fd);
+
+					fru_chassis_area_t *chassis_area =
+						find_fru_chassis_area(buffer, statbuf.st_size);
+					if (chassis_area) {
+						if (!fru_decode_chassis_info(chassis_area, &chassis))
 							fatal("Failed to decode chassis");
-
-						free(chassis_raw);
 						has_chassis = true;
 					}
-					if (raw_fru->board != 0) {
-						if(lseek(fd, 8 * raw_fru->board, SEEK_SET) < 0)
-							fatal("Failed to seek");
-
-						fru_board_area_t *board_raw = read_fru_board_area(fd);
-						bool success = fru_decode_board_info(board_raw, &board);
-						if (!success)
+					fru_board_area_t *board_area =
+						find_fru_board_area(buffer, statbuf.st_size);
+					if (board_area) {
+						if (!fru_decode_board_info(board_area, &board))
 							fatal("Failed to decode board");
-
-						free(board_raw);
 						has_board = true;
-						has_bdate = true;
 					}
-					if (raw_fru->product != 0) {
-						if (lseek(fd, 8 * raw_fru->product, SEEK_SET) < 0)
-							fatal("Failed to seek");
 
-						fru_product_area_t *product_raw =
-							read_fru_product_area(fd);
-						bool success =
-							fru_decode_product_info(product_raw, &product);
-						if (!success)
+					fru_product_area_t *product_area =
+						find_fru_product_area(buffer, statbuf.st_size);
+					if (product_area) {
+						if (!fru_decode_product_info(product_area, &product))
 							fatal("Failed to decode product");
-
-						free(product_raw);
 						has_product = true;
 					}
 
-					free(raw_fru);
-					close(fd);
+					free(buffer);
 				}
 				else {
 					fatal("The requested input file format is not supported");
